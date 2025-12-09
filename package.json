@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "open-factura": "^1.0.3"
+    "open-factura": "latest"
   }
 }
