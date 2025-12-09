@@ -1,21 +1,18 @@
 import express from 'express';
 import fs from 'fs';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process'; // Usamos spawn que es más seguro para contraseñas
 import { 
   generateInvoice, 
   generateInvoiceXml, 
   signXml
 } from 'open-factura';
 
-// --- HACK Fetch (Necesario para Node.js) ---
+// --- HACK Fetch ---
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const fetch = require('node-fetch');
 global.fetch = fetch;
-// ------------------------------------------
-
-const execAsync = promisify(exec);
+// ------------------
 
 const SRI_URLS = {
     test: {
@@ -28,7 +25,7 @@ const SRI_URLS = {
     }
 };
 
-// --- FUNCIÓN 1: REPARAR FIRMA ---
+// --- FUNCIÓN DE REPARACIÓN BLINDADA ---
 async function repararFirma(bufferFirma, password) {
     const id = Date.now();
     const inputPath = `/tmp/firma_in_${id}.p12`;
@@ -36,41 +33,63 @@ async function repararFirma(bufferFirma, password) {
 
     try {
         fs.writeFileSync(inputPath, bufferFirma);
-        // Comando OpenSSL para convertir a formato Legacy (3DES) compatible
-        const comando = `openssl pkcs12 -in ${inputPath} -export -out ${outputPath} -passin pass:"${password}" -passout pass:"${password}" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES`;
-        await execAsync(comando);
+
+        // Usamos una promesa con SPAWN para manejar caracteres raros en la contraseña
+        await new Promise((resolve, reject) => {
+            // Comando: openssl pkcs12 -in IN -legacy -nodes -provider default -passin pass:PW | openssl pkcs12 -export -out OUT -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -passout pass:PW
+            // Lo hacemos en dos pasos via pipe para máxima compatibilidad
+            
+            const p1 = spawn('openssl', [
+                'pkcs12', '-in', inputPath,
+                '-legacy', '-provider', 'default', // Forzamos lectura de formatos viejos y nuevos
+                '-nodes', 
+                '-passin', `pass:${password}`
+            ]);
+
+            const p2 = spawn('openssl', [
+                'pkcs12', '-export', '-out', outputPath,
+                '-keypbe', 'PBE-SHA1-3DES', // Encriptación antigua compatible con Node
+                '-certpbe', 'PBE-SHA1-3DES',
+                '-passout', `pass:${password}`
+            ]);
+
+            // Conectamos la salida del 1 a la entrada del 2
+            p1.stdout.pipe(p2.stdin);
+
+            // Capturamos errores
+            let errorLog = '';
+            p1.stderr.on('data', d => errorLog += d);
+            p2.stderr.on('data', d => errorLog += d);
+
+            p2.on('close', (code) => {
+                if (code === 0) resolve();
+                else reject(new Error(`OpenSSL falló con código ${code}: ${errorLog}`));
+            });
+        });
+
         const bufferReparado = fs.readFileSync(outputPath);
         return bufferReparado;
+
     } catch (error) {
-        console.error("Error reparando firma:", error.message);
-        return bufferFirma; // Si falla, devolvemos la original
+        console.error("⚠️ La reparación falló:", error.message);
+        console.log("Intentando usar la firma original...");
+        return bufferFirma; 
     } finally {
+        // Limpieza
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
         if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     }
 }
 
-// --- FUNCIONES SOAP SRI ---
+// ... (Funciones SRI iguales que antes) ...
 async function recibirSRI(xmlFirmado, url) {
-    const soapBody = `
-    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.recepcion">
-       <soapenv:Header/>
-       <soapenv:Body>
-          <ec:validarComprobante><xml>${Buffer.from(xmlFirmado).toString('base64')}</xml></ec:validarComprobante>
-       </soapenv:Body>
-    </soapenv:Envelope>`;
+    const soapBody = `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.recepcion"><soapenv:Header/><soapenv:Body><ec:validarComprobante><xml>${Buffer.from(xmlFirmado).toString('base64')}</xml></ec:validarComprobante></soapenv:Body></soapenv:Envelope>`;
     const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml;charset=UTF-8' }, body: soapBody });
     return response.text();
 }
 
 async function autorizarSRI(claveAcceso, url) {
-    const soapBody = `
-    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.autorizacion">
-       <soapenv:Header/>
-       <soapenv:Body>
-          <ec:autorizacionComprobante><claveAccesoComprobante>${claveAcceso}</claveAccesoComprobante></ec:autorizacionComprobante>
-       </soapenv:Body>
-    </soapenv:Envelope>`;
+    const soapBody = `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.autorizacion"><soapenv:Header/><soapenv:Body><ec:autorizacionComprobante><claveAccesoComprobante>${claveAcceso}</claveAccesoComprobante></ec:autorizacionComprobante></soapenv:Body></soapenv:Envelope>`;
     const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml;charset=UTF-8' }, body: soapBody });
     return response.text();
 }
@@ -80,50 +99,74 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// RUTA 1: CONSULTAR RUC (GET)
+// RUTA 1: CONSULTAR RUC (MEJORADA CON DISFRAZ)
 // ==========================================
 app.get('/consultar-ruc/:ruc', async (req, res) => {
     const { ruc } = req.params;
+    
+    // URL oficial del SRI
     const urlSRI = `https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc=${ruc}`;
 
     try {
-        console.log(`Consultando RUC: ${ruc}...`);
-        const response = await fetch(urlSRI);
+        console.log(`🔎 Consultando RUC: ${ruc}...`);
         
-        if (!response.ok) return res.status(404).json({ error: "RUC no encontrado" });
+        // AQUÍ ESTÁ EL TRUCO: Le enviamos cabeceras para parecer un navegador real
+        const response = await fetch(urlSRI, {
+            method: 'GET',
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://srienlinea.sri.gob.ec/sri-en-linea/",
+                "Origin": "https://srienlinea.sri.gob.ec",
+                "Accept": "application/json, text/plain, */*"
+            }
+        });
+        
+        if (!response.ok) {
+            console.log("SRI respondió error:", response.status);
+            return res.status(404).json({ error: "RUC no encontrado o SRI bloqueó la petición." });
+        }
 
         const data = await response.json();
+        
+        // Verificamos si trajo datos reales
+        if (!data || !data.numeroRuc) {
+             return res.status(404).json({ error: "El SRI devolvió vacío." });
+        }
+
+        console.log("✅ Datos encontrados:", data.razonSocial);
+
         res.json({
             ruc: data.numeroRuc,
             razonSocial: data.razonSocial,
             nombreComercial: data.nombreComercial,
-            estado: data.estadoPersona?.descripcion
+            estado: data.estadoPersona?.descripcion,
+            tipo: data.tipoContribuyente?.descripcion
         });
+
     } catch (error) {
-        console.error("Error consultando RUC:", error);
+        console.error("❌ Error consultando RUC:", error.message);
         res.status(500).json({ error: "Error de conexión con el SRI" });
     }
 });
 
-// ==========================================
-// RUTA 2: EMITIR FACTURA (POST)
-// ==========================================
 app.post('/emitir-factura', async (req, res) => {
   try {
-    console.log("--- NUEVA FACTURA ---");
+    console.log("--- NUEVA SOLICITUD ---");
     const { firmaP12, passwordFirma, ...datosFactura } = req.body;
 
     if (!firmaP12 || !passwordFirma) throw new Error("Faltan datos de firma.");
 
-    // 1. Limpieza y Reparación
+    // Limpieza
     let firmaLimpia = firmaP12.includes(",") ? firmaP12.split(",")[1] : firmaP12;
     firmaLimpia = firmaLimpia.replace(/\s/g, ''); 
     const bufferOriginal = Buffer.from(firmaLimpia, 'base64');
     
-    console.log("Reparando firma...");
+    // REPARACIÓN
+    console.log("Reparando firma (Modo Seguro)...");
     const bufferFirma = await repararFirma(bufferOriginal, passwordFirma);
+    console.log(`Tamaño firma final: ${bufferFirma.length} bytes`);
 
-    // 2. Generar XML
+    // Proceso Normal
     const ambiente = datosFactura.infoTributaria.ambiente; 
     const URL_RECEPCION = ambiente === "2" ? SRI_URLS.production.recepcion : SRI_URLS.test.recepcion;
     const URL_AUTORIZACION = ambiente === "2" ? SRI_URLS.production.autorizacion : SRI_URLS.test.autorizacion;
@@ -131,11 +174,11 @@ app.post('/emitir-factura', async (req, res) => {
     const { invoice, accessKey } = generateInvoice(datosFactura);
     const xmlSinFirmar = generateInvoiceXml(invoice);
 
-    // 3. Firmar
-    console.log("Firmando...");
+    console.log("Firmando XML...");
+    // AQUI ES DONDE SABREMOS SI FUNCIONÓ
     const xmlFirmado = await signXml(bufferFirma, passwordFirma, xmlSinFirmar);
+    console.log("¡FIRMADO EXITOSO!");
 
-    // 4. Enviar
     console.log("Enviando al SRI...");
     const respuestaRecepcion = await recibirSRI(xmlFirmado, URL_RECEPCION);
     
@@ -143,7 +186,6 @@ app.post('/emitir-factura', async (req, res) => {
         return res.json({ estado: "ERROR_RECEPCION", respuestaSRI: respuestaRecepcion });
     }
 
-    // 5. Autorizar
     await new Promise(r => setTimeout(r, 3000));
     const respuestaAutorizacion = await autorizarSRI(accessKey, URL_AUTORIZACION);
 
@@ -155,9 +197,9 @@ app.post('/emitir-factura', async (req, res) => {
     });
 
   } catch (error) {
-    console.error("💥 ERROR:", error);
-    res.status(500).json({ error: error.message });
+    console.error("💥 ERROR:", error.message);
+    res.status(500).json({ error: error.message, hint: "Si dice 'mac verify error', la contraseña es incorrecta." });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 API Completa lista en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Listo en puerto ${PORT}`));
