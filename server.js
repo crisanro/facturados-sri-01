@@ -55,6 +55,37 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3000;
 
+// --- NUEVA RUTA PARA BUSCAR DATOS DE RUC ---
+app.get('/consultar-ruc/:ruc', async (req, res) => {
+    const { ruc } = req.params;
+    
+    // Esta es la URL que usa la página del SRI internamente
+    const urlSRI = `https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc=${ruc}`;
+
+    try {
+        const response = await fetch(urlSRI);
+        
+        // Si el SRI dice que no existe o da error
+        if (!response.ok) {
+            return res.status(404).json({ error: "RUC no encontrado o SRI caído" });
+        }
+
+        const data = await response.json();
+        
+        // El SRI devuelve algo como: { "numeroRuc": "...", "razonSocial": "..." }
+        res.json({
+            ruc: data.numeroRuc,
+            razonSocial: data.razonSocial, // <--- AQUÍ ESTÁ EL NOMBRE QUE BUSCAS
+            nombreComercial: data.nombreComercial,
+            estado: data.estadoPersona?.descripcion
+        });
+
+    } catch (error) {
+        res.status(500).json({ error: "Error consultando al SRI" });
+    }
+});
+
+
 app.post('/emitir-factura', async (req, res) => {
   try {
     console.log("--- NUEVA SOLICITUD ---");
@@ -125,3 +156,4 @@ app.post('/emitir-factura', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🚀 Debugger listo en puerto ${PORT}`));
+
