@@ -151,6 +151,10 @@ app.post('/emitir-factura', async (req, res) => {
     console.log("- RUC:", datosFactura.infoTributaria?.ruc);
     console.log("- Ambiente:", datosFactura.infoTributaria?.ambiente);
     console.log("- Detalles:", datosFactura.detalles?.length, "items");
+    
+    // 🔍 DEBUG: Imprimir estructura completa
+    console.log("\n🔍 ESTRUCTURA COMPLETA RECIBIDA:");
+    console.log(JSON.stringify(datosFactura, null, 2));
 
     // 1. LIMPIEZA
     let firmaLimpia = firmaP12.includes(",") ? firmaP12.split(",")[1] : firmaP12;
@@ -162,15 +166,22 @@ app.post('/emitir-factura', async (req, res) => {
     const URL_RECEPCION = ambiente === "2" ? SRI_URLS.production.recepcion : SRI_URLS.test.recepcion;
     const URL_AUTORIZACION = ambiente === "2" ? SRI_URLS.production.autorizacion : SRI_URLS.test.autorizacion;
     
-    console.log("🔧 Generando XML...");
+    console.log("\n🔧 Generando XML...");
+    console.log("Llamando a generateInvoice con datosFactura...");
+    
     let invoice, accessKey;
     try {
         const result = generateInvoice(datosFactura);
+        console.log("📦 Resultado de generateInvoice:", typeof result, result);
+        
         invoice = result.invoice;
         accessKey = result.accessKey;
+        
         console.log("✅ XML generado. Clave de acceso:", accessKey);
     } catch (error) {
-        console.error("❌ Error generando invoice:", error);
+        console.error("❌ Error generando invoice:");
+        console.error("   Mensaje:", error.message);
+        console.error("   Stack:", error.stack);
         throw new Error(`Error al generar factura: ${error.message}`);
     }
 
@@ -242,6 +253,167 @@ app.post('/emitir-factura', async (req, res) => {
         stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
+});
+
+// ==========================================
+// RUTA 3: BUSCAR POR NOMBRE
+// ==========================================
+app.get('/buscar-contribuyente/:nombre', async (req, res) => {
+    const { nombre } = req.params;
+    const urlSRI = `https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNombre?nombre=${encodeURIComponent(nombre)}`;
+
+    try {
+        console.log(`🔎 Buscando contribuyentes con nombre: ${nombre}...`);
+        
+        const response = await fetch(urlSRI, {
+            method: 'GET',
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://srienlinea.sri.gob.ec/sri-en-linea/",
+                "Origin": "https://srienlinea.sri.gob.ec",
+                "Accept": "application/json, text/plain, */*"
+            }
+        });
+        
+        if (!response.ok) return res.status(response.status).json({ error: "Error consultando al SRI." });
+
+        const data = await response.json();
+        
+        if (!data || !Array.isArray(data) || data.length === 0) {
+            return res.json({ 
+                mensaje: "No se encontraron contribuyentes con ese nombre.",
+                resultados: []
+            });
+        }
+
+        const resultados = data.map(c => ({
+            ruc: c.numeroRuc,
+            razonSocial: c.razonSocial,
+            nombreComercial: c.nombreComercial,
+            estado: c.estadoPersona?.descripcion,
+            provincia: c.provincia?.descripcion,
+            canton: c.canton?.descripcion
+        }));
+
+        console.log(`✅ Se encontraron ${resultados.length} resultados`);
+        res.json({ total: resultados.length, resultados });
+
+    } catch (error) {
+        console.error("❌ Error buscando contribuyente:", error.message);
+        res.status(500).json({ error: "Error interno de conexión con el SRI" });
+    }
+});
+
+// ==========================================
+// RUTA 4: CONSULTAR ESTABLECIMIENTOS
+// ==========================================
+app.get('/establecimientos/:ruc', async (req, res) => {
+    const { ruc } = req.params;
+    const urlSRI = `https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumeroRuc?numeroRuc=${ruc}`;
+
+    try {
+        console.log(`🏢 Consultando establecimientos del RUC: ${ruc}...`);
+        
+        const response = await fetch(urlSRI, {
+            method: 'GET',
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://srienlinea.sri.gob.ec/sri-en-linea/",
+                "Origin": "https://srienlinea.sri.gob.ec",
+                "Accept": "application/json, text/plain, */*"
+            }
+        });
+        
+        if (!response.ok) return res.status(response.status).json({ error: "Error consultando al SRI." });
+
+        const data = await response.json();
+        
+        if (!data || !Array.isArray(data) || data.length === 0) {
+            return res.status(404).json({ error: "RUC no encontrado." });
+        }
+
+        const contribuyente = data[0];
+        const establecimientos = contribuyente.establecimientos || [];
+
+        const establecimientosDetalle = establecimientos.map(e => ({
+            numeroEstablecimiento: e.numeroEstablecimiento,
+            direccion: e.direccionCompleta,
+            provincia: e.provincia?.descripcion,
+            canton: e.canton?.descripcion,
+            estado: e.estadoEstablecimiento?.descripcion,
+            actividadEconomica: e.actividadEconomica?.descripcion
+        }));
+
+        res.json({
+            ruc: contribuyente.numeroRuc,
+            razonSocial: contribuyente.razonSocial,
+            totalEstablecimientos: establecimientosDetalle.length,
+            establecimientos: establecimientosDetalle
+        });
+
+    } catch (error) {
+        console.error("❌ Error consultando establecimientos:", error.message);
+        res.status(500).json({ error: "Error interno de conexión con el SRI" });
+    }
+});
+
+// ==========================================
+// RUTA 5: VERIFICAR FACTURA AUTORIZADA
+// ==========================================
+app.get('/verificar-factura/:claveAcceso', async (req, res) => {
+    const { claveAcceso } = req.params;
+    
+    // Validar que tenga 49 dígitos
+    if (claveAcceso.length !== 49 || !/^\d+$/.test(claveAcceso)) {
+        return res.status(400).json({ 
+            error: "Clave de acceso inválida. Debe tener 49 dígitos numéricos." 
+        });
+    }
+
+    try {
+        console.log(`🧾 Verificando autorización de factura: ${claveAcceso}...`);
+        
+        const ambiente = claveAcceso[23] === "2" ? "production" : "test";
+        const URL_AUTORIZACION = SRI_URLS[ambiente].autorizacion;
+
+        const respuesta = await autorizarSRI(claveAcceso, URL_AUTORIZACION);
+        
+        // Extraer estado del XML
+        const esAutorizada = respuesta.includes("<estado>AUTORIZADO</estado>");
+        const esRechazada = respuesta.includes("<estado>NO AUTORIZADO</estado>");
+        
+        let estado = "PENDIENTE";
+        if (esAutorizada) estado = "AUTORIZADO";
+        if (esRechazada) estado = "NO AUTORIZADO";
+
+        res.json({
+            claveAcceso,
+            estado,
+            ambiente: ambiente === "production" ? "Producción" : "Pruebas",
+            respuestaCompleta: respuesta
+        });
+
+    } catch (error) {
+        console.error("❌ Error verificando factura:", error.message);
+        res.status(500).json({ error: "Error consultando autorización" });
+    }
+});
+
+// ==========================================
+// RUTA 6: HEALTH CHECK
+// ==========================================
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        endpoints: {
+            consultarRuc: '/consultar-ruc/:ruc',
+            buscarNombre: '/buscar-contribuyente/:nombre',
+            establecimientos: '/establecimientos/:ruc',
+            emitirFactura: '/emitir-factura',
+            verificarFactura: '/verificar-factura/:claveAcceso'
+        }
+    });
 });
 
 app.listen(PORT, () => console.log(`🚀 API Multi-Cliente lista en puerto ${PORT}`));
