@@ -147,14 +147,18 @@ app.post('/emitir-factura', async (req, res) => {
         });
     }
 
+    // VALIDACIÓN 3: totalConImpuestos es OBLIGATORIO
+    if (!datosFactura.infoFactura.totalConImpuestos) {
+        return res.status(400).json({
+            error: "Campo obligatorio faltante: infoFactura.totalConImpuestos",
+            hint: "Debe incluir el array totalConImpuestos con la estructura correcta"
+        });
+    }
+
     console.log("📄 Datos recibidos:");
     console.log("- RUC:", datosFactura.infoTributaria?.ruc);
     console.log("- Ambiente:", datosFactura.infoTributaria?.ambiente);
     console.log("- Detalles:", datosFactura.detalles?.length, "items");
-    
-    // 🔍 DEBUG: Imprimir estructura completa
-    console.log("\n🔍 ESTRUCTURA COMPLETA RECIBIDA:");
-    console.log(JSON.stringify(datosFactura, null, 2));
 
     // 1. LIMPIEZA
     let firmaLimpia = firmaP12.includes(",") ? firmaP12.split(",")[1] : firmaP12;
@@ -166,34 +170,33 @@ app.post('/emitir-factura', async (req, res) => {
     const URL_RECEPCION = ambiente === "2" ? SRI_URLS.production.recepcion : SRI_URLS.test.recepcion;
     const URL_AUTORIZACION = ambiente === "2" ? SRI_URLS.production.autorizacion : SRI_URLS.test.autorizacion;
     
-    console.log("\n🔧 Generando XML...");
-    console.log("Llamando a generateInvoice con datosFactura...");
-    
+    console.log("🔧 Generando factura...");
     let invoice, accessKey;
+    
     try {
         const result = generateInvoice(datosFactura);
-        console.log("📦 Resultado de generateInvoice:", typeof result, result);
-        
         invoice = result.invoice;
         accessKey = result.accessKey;
-        
-        console.log("✅ XML generado. Clave de acceso:", accessKey);
+        console.log("✅ Factura generada. Clave:", accessKey);
     } catch (error) {
-        console.error("❌ Error generando invoice:");
-        console.error("   Mensaje:", error.message);
-        console.error("   Stack:", error.stack);
-        throw new Error(`Error al generar factura: ${error.message}`);
+        console.error("❌ Error en generateInvoice:", error.message);
+        console.error("Stack completo:", error.stack);
+        return res.status(400).json({ 
+            error: "Error generando factura", 
+            detalle: error.message,
+            sugerencia: "Verifique la estructura del JSON según la ficha técnica del SRI"
+        });
     }
 
     const xmlSinFirmar = generateInvoiceXml(invoice);
 
-    // 3. FIRMADO INTELIGENTE (Try Original -> Catch -> Try Reparado)
+    // 3. FIRMADO INTELIGENTE
     let xmlFirmado;
     
     try {
         console.log("🔒 Intentando firmar con archivo original...");
         xmlFirmado = await signXml(bufferOriginal, passwordFirma, xmlSinFirmar);
-        console.log("✅ Firmado exitoso con archivo original.");
+        console.log("✅ Firmado exitoso.");
     } catch (errorOriginal) {
         console.warn("⚠️ Falló firma original:", errorOriginal.message);
         
@@ -208,49 +211,35 @@ app.post('/emitir-factura', async (req, res) => {
             xmlFirmado = await signXml(bufferReparado, passwordFirma, xmlSinFirmar);
             console.log("✅ Firmado exitoso con archivo reparado.");
         } else {
-            throw new Error("No se pudo procesar la firma electrónica. Verifica el archivo.");
+            throw new Error("No se pudo procesar la firma electrónica.");
         }
     }
 
     // 4. ENVIAR SRI
-    console.log(`📤 Enviando factura de ${datosFactura.infoTributaria.ruc} al SRI (${ambiente === "2" ? "PRODUCCIÓN" : "PRUEBAS"})...`);
+    console.log(`📤 Enviando al SRI (${ambiente === "2" ? "PRODUCCIÓN" : "PRUEBAS"})...`);
     const respuestaRecepcion = await recibirSRI(xmlFirmado, URL_RECEPCION);
     
-    console.log("📥 Respuesta recepción:", respuestaRecepcion.substring(0, 500));
-    
     if (!respuestaRecepcion.includes("RECIBIDA")) {
-        return res.json({ 
-            estado: "ERROR_RECEPCION", 
-            respuestaSRI: respuestaRecepcion,
-            claveAcceso: accessKey 
-        });
+        return res.json({ estado: "ERROR_RECEPCION", respuestaSRI: respuestaRecepcion });
     }
 
     // 5. AUTORIZAR
-    console.log("⏳ Esperando 2.5s antes de consultar autorización...");
     await new Promise(r => setTimeout(r, 2500));
-    
-    console.log("🔍 Consultando autorización...");
     const respuestaAutorizacion = await autorizarSRI(accessKey, URL_AUTORIZACION);
 
-    const estadoFinal = respuestaAutorizacion.includes("AUTORIZADO") ? "AUTORIZADO" : 
-                       respuestaAutorizacion.includes("PENDIENTE") ? "PENDIENTE" : "ERROR";
-
-    console.log(`✅ Estado final: ${estadoFinal}`);
-
     res.json({
-        estado: estadoFinal,
+        estado: respuestaAutorizacion.includes("AUTORIZADO") ? "AUTORIZADO" : "PENDIENTE",
         claveAcceso: accessKey,
         xmlFirmado: xmlFirmado,
         respuestaSRI: respuestaAutorizacion
     });
 
   } catch (error) {
-    console.error("💥 ERROR SERVICIO:", error.message);
+    console.error("💥 ERROR:", error.message);
     console.error("Stack:", error.stack);
     res.status(500).json({ 
         error: error.message,
-        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        tipo: error.name
     });
   }
 });
