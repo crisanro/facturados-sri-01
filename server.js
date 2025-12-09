@@ -77,7 +77,7 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// RUTA 1: CONSULTAR RUC (TU CÓDIGO - INTACTO)
+// RUTA 1: CONSULTAR RUC
 // ==========================================
 app.get('/consultar-ruc/:ruc', async (req, res) => {
     const { ruc } = req.params;
@@ -99,6 +99,12 @@ app.get('/consultar-ruc/:ruc', async (req, res) => {
         if (!response.ok) return res.status(response.status).json({ error: "Error consultando al SRI." });
 
         const data = await response.json();
+        
+        // VALIDACIÓN AGREGADA
+        if (!data || !Array.isArray(data) || data.length === 0) {
+            return res.status(404).json({ error: "RUC no encontrado o respuesta vacía del SRI." });
+        }
+
         const contribuyente = data[0];
 
         if (!contribuyente) return res.status(404).json({ error: "RUC no encontrado." });
@@ -128,9 +134,23 @@ app.post('/emitir-factura', async (req, res) => {
   try {
     const { firmaP12, passwordFirma, ...datosFactura } = req.body;
 
+    // VALIDACIÓN 1: Credenciales
     if (!firmaP12 || !passwordFirma) {
         return res.status(400).json({ error: "Faltan credenciales: 'firmaP12' y 'passwordFirma'." });
     }
+
+    // VALIDACIÓN 2: Estructura de datos
+    if (!datosFactura.infoTributaria || !datosFactura.infoFactura || !datosFactura.detalles) {
+        return res.status(400).json({ 
+            error: "Estructura de datos incompleta. Se requiere: infoTributaria, infoFactura y detalles.",
+            receivedKeys: Object.keys(datosFactura)
+        });
+    }
+
+    console.log("📄 Datos recibidos:");
+    console.log("- RUC:", datosFactura.infoTributaria?.ruc);
+    console.log("- Ambiente:", datosFactura.infoTributaria?.ambiente);
+    console.log("- Detalles:", datosFactura.detalles?.length, "items");
 
     // 1. LIMPIEZA
     let firmaLimpia = firmaP12.includes(",") ? firmaP12.split(",")[1] : firmaP12;
@@ -141,7 +161,19 @@ app.post('/emitir-factura', async (req, res) => {
     const ambiente = datosFactura.infoTributaria.ambiente; 
     const URL_RECEPCION = ambiente === "2" ? SRI_URLS.production.recepcion : SRI_URLS.test.recepcion;
     const URL_AUTORIZACION = ambiente === "2" ? SRI_URLS.production.autorizacion : SRI_URLS.test.autorizacion;
-    const { invoice, accessKey } = generateInvoice(datosFactura);
+    
+    console.log("🔧 Generando XML...");
+    let invoice, accessKey;
+    try {
+        const result = generateInvoice(datosFactura);
+        invoice = result.invoice;
+        accessKey = result.accessKey;
+        console.log("✅ XML generado. Clave de acceso:", accessKey);
+    } catch (error) {
+        console.error("❌ Error generando invoice:", error);
+        throw new Error(`Error al generar factura: ${error.message}`);
+    }
+
     const xmlSinFirmar = generateInvoiceXml(invoice);
 
     // 3. FIRMADO INTELIGENTE (Try Original -> Catch -> Try Reparado)
@@ -149,18 +181,15 @@ app.post('/emitir-factura', async (req, res) => {
     
     try {
         console.log("🔒 Intentando firmar con archivo original...");
-        // Intentamos firmar con el archivo tal cual llegó
         xmlFirmado = await signXml(bufferOriginal, passwordFirma, xmlSinFirmar);
+        console.log("✅ Firmado exitoso con archivo original.");
     } catch (errorOriginal) {
-        // Si falla, analizamos por qué
         console.warn("⚠️ Falló firma original:", errorOriginal.message);
         
-        // Si la contraseña está mal, no sirve de nada reparar. Fallamos directo.
         if (errorOriginal.message.includes("Invalid password") || errorOriginal.message.includes("MAC")) {
             throw new Error("Contraseña de firma incorrecta.");
         }
 
-        // Si es otro error (posiblemente formato moderno), intentamos reparar
         console.log("🔧 Intentando reparar firma...");
         const bufferReparado = await repararFirma(bufferOriginal, passwordFirma);
         
@@ -173,19 +202,33 @@ app.post('/emitir-factura', async (req, res) => {
     }
 
     // 4. ENVIAR SRI
-    console.log(`Enviando factura de ${datosFactura.infoTributaria.ruc} al SRI...`);
+    console.log(`📤 Enviando factura de ${datosFactura.infoTributaria.ruc} al SRI (${ambiente === "2" ? "PRODUCCIÓN" : "PRUEBAS"})...`);
     const respuestaRecepcion = await recibirSRI(xmlFirmado, URL_RECEPCION);
     
+    console.log("📥 Respuesta recepción:", respuestaRecepcion.substring(0, 500));
+    
     if (!respuestaRecepcion.includes("RECIBIDA")) {
-        return res.json({ estado: "ERROR_RECEPCION", respuestaSRI: respuestaRecepcion });
+        return res.json({ 
+            estado: "ERROR_RECEPCION", 
+            respuestaSRI: respuestaRecepcion,
+            claveAcceso: accessKey 
+        });
     }
 
     // 5. AUTORIZAR
+    console.log("⏳ Esperando 2.5s antes de consultar autorización...");
     await new Promise(r => setTimeout(r, 2500));
+    
+    console.log("🔍 Consultando autorización...");
     const respuestaAutorizacion = await autorizarSRI(accessKey, URL_AUTORIZACION);
 
+    const estadoFinal = respuestaAutorizacion.includes("AUTORIZADO") ? "AUTORIZADO" : 
+                       respuestaAutorizacion.includes("PENDIENTE") ? "PENDIENTE" : "ERROR";
+
+    console.log(`✅ Estado final: ${estadoFinal}`);
+
     res.json({
-        estado: respuestaAutorizacion.includes("AUTORIZADO") ? "EXITO" : "PENDIENTE",
+        estado: estadoFinal,
         claveAcceso: accessKey,
         xmlFirmado: xmlFirmado,
         respuestaSRI: respuestaAutorizacion
@@ -193,7 +236,11 @@ app.post('/emitir-factura', async (req, res) => {
 
   } catch (error) {
     console.error("💥 ERROR SERVICIO:", error.message);
-    res.status(500).json({ error: error.message });
+    console.error("Stack:", error.stack);
+    res.status(500).json({ 
+        error: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
