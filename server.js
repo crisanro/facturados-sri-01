@@ -3,17 +3,15 @@ import {
   generateInvoice, 
   generateInvoiceXml, 
   signXml
-  // Quitamos las URLs de aquí porque causaban el error
 } from 'open-factura';
 
-// --- HACK para que funcione fetch en Node.js ---
+// --- HACK Fetch ---
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const fetch = require('node-fetch');
 global.fetch = fetch;
-// ----------------------------------------------
+// ------------------
 
-// --- DEFINIMOS LAS URLS DEL SRI MANUALMENTE (Para evitar el error) ---
 const SRI_URLS = {
     test: {
         recepcion: "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
@@ -25,7 +23,6 @@ const SRI_URLS = {
     }
 };
 
-// --- FUNCIONES DE AYUDA (SOAP) ---
 async function recibirSRI(xmlFirmado, url) {
     const soapBody = `
     <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.recepcion">
@@ -36,12 +33,7 @@ async function recibirSRI(xmlFirmado, url) {
           </ec:validarComprobante>
        </soapenv:Body>
     </soapenv:Envelope>`;
-
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/xml;charset=UTF-8' },
-        body: soapBody
-    });
+    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml;charset=UTF-8' }, body: soapBody });
     return response.text();
 }
 
@@ -55,95 +47,81 @@ async function autorizarSRI(claveAcceso, url) {
           </ec:autorizacionComprobante>
        </soapenv:Body>
     </soapenv:Envelope>`;
-
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/xml;charset=UTF-8' },
-        body: soapBody
-    });
+    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/xml;charset=UTF-8' }, body: soapBody });
     return response.text();
 }
 
 const app = express();
-// Aumentamos el limite para recibir la firma en base64
 app.use(express.json({ limit: '10mb' }));
-
 const PORT = process.env.PORT || 3000;
 
 app.post('/emitir-factura', async (req, res) => {
   try {
     console.log("--- NUEVA SOLICITUD ---");
-    
-    // Extraemos los datos del JSON
     const { firmaP12, passwordFirma, ...datosFactura } = req.body;
 
-    if (!firmaP12 || !passwordFirma) {
-        throw new Error("Faltan datos: Debes enviar 'firmaP12' (base64) y 'passwordFirma'");
-    }
+    if (!firmaP12 || !passwordFirma) throw new Error("Faltan datos de firma.");
 
-    // 0. Detectar Ambiente (1: Pruebas, 2: Producción)
-    const ambiente = datosFactura.infoTributaria.ambiente; 
+    // --- DIAGNÓSTICO DE LA FIRMA ---
+    console.log(`Password recibido: [${passwordFirma}] (Longitud: ${passwordFirma.length})`);
     
-    // Seleccionamos la URL correcta usando nuestro objeto manual
+    // 1. LIMPIEZA TOTAL DEL BASE64
+    let firmaLimpia = firmaP12;
+    // Si tiene encabezado data:..., lo quitamos
+    if (firmaLimpia.includes(",")) firmaLimpia = firmaLimpia.split(",")[1];
+    // Quitamos espacios en blanco y saltos de línea (CRÍTICO)
+    firmaLimpia = firmaLimpia.replace(/\s/g, ''); 
+    
+    console.log(`Firma Base64 limpia (Primeros 20 chars): ${firmaLimpia.substring(0, 20)}...`);
+    console.log(`Longitud Base64: ${firmaLimpia.length}`);
+
+    // 2. CONVERTIR A BUFFER
+    const bufferFirma = Buffer.from(firmaLimpia, 'base64');
+    console.log(`Buffer creado. Tamaño en bytes: ${bufferFirma.length}`);
+    
+    if (bufferFirma.length === 0) throw new Error("El Buffer de la firma está vacío.");
+
+    // 3. GENERAR XML
+    const ambiente = datosFactura.infoTributaria.ambiente; 
     const URL_RECEPCION = ambiente === "2" ? SRI_URLS.production.recepcion : SRI_URLS.test.recepcion;
     const URL_AUTORIZACION = ambiente === "2" ? SRI_URLS.production.autorizacion : SRI_URLS.test.autorizacion;
 
-    // 1. Generar XML
     const { invoice, accessKey } = generateInvoice(datosFactura);
     const xmlSinFirmar = generateInvoiceXml(invoice);
-    console.log("1. XML Generado. Clave:", accessKey);
+    console.log("XML Generado OK.");
 
-// 2. Firmar XML
-    // LIMPIEZA AUTOMÁTICA DE BASE64
-    // Si el usuario mandó "data:application/...", lo quitamos para quedarnos solo con el código
-    let firmaLimpia = firmaP12;
-    if (firmaLimpia.includes(",")) {
-        firmaLimpia = firmaLimpia.split(",")[1]; 
-    }
-
-    const bufferFirma = Buffer.from(firmaLimpia, 'base64');
-    
-    // Verificación de seguridad: Si el buffer está vacío o corrupto, avisar antes de crashear
-    if (bufferFirma.length === 0) {
-        throw new Error("La firma electrónica (Base64) parece estar vacía o mal formada.");
-    }
-
+    // 4. FIRMAR (Aquí es donde fallaba)
+    console.log("Intentando firmar...");
     const xmlFirmado = await signXml(bufferFirma, passwordFirma, xmlSinFirmar);
-    console.log("2. XML Firmado correctamente.");
+    console.log("¡FIRMADO EXITOSO! 🎉");
 
-    // 3. Enviar a Recepción SRI
-    console.log("3. Enviando al SRI (" + (ambiente==="2"?"Producción":"Pruebas") + ")...");
+    // 5. ENVIAR SRI
+    console.log("Enviando al SRI...");
     const respuestaRecepcion = await recibirSRI(xmlFirmado, URL_RECEPCION);
     
     if (!respuestaRecepcion.includes("RECIBIDA")) {
-        console.log("Respuesta SRI (Recepción):", respuestaRecepcion);
-        return res.json({ 
-            estado: "ERROR_RECEPCION", 
-            mensaje: "El SRI no recibió el comprobante.",
-            respuestaSRI: respuestaRecepcion 
-        });
+        console.log("SRI Rechazo:", respuestaRecepcion);
+        return res.json({ estado: "ERROR_RECEPCION", respuestaSRI: respuestaRecepcion });
     }
 
-    // 4. Autorización
-    console.log("4. Esperando autorización...");
-    await new Promise(r => setTimeout(r, 3000)); // Esperamos 3 segundos
+    await new Promise(r => setTimeout(r, 3000));
     const respuestaAutorizacion = await autorizarSRI(accessKey, URL_AUTORIZACION);
 
-    // Verificamos si fue autorizado
-    const autorizado = respuestaAutorizacion.includes("AUTORIZADO");
-    
     res.json({
-        estado: autorizado ? "EXITO" : "RECHAZADO_O_PROCESANDO",
+        estado: respuestaAutorizacion.includes("AUTORIZADO") ? "EXITO" : "PENDIENTE",
         claveAcceso: accessKey,
         xmlFirmado: xmlFirmado,
         respuestaSRI: respuestaAutorizacion
     });
 
   } catch (error) {
-    console.error("ERROR INTERNO:", error.message);
-    res.status(500).json({ error: error.message, stack: error.stack });
+    console.error("💥 ERROR FATAL:", error);
+    // Devolvemos el error detallado para que lo veas en Postman
+    res.status(500).json({ 
+        error: error.message, 
+        detalle: "Revisa los logs de Easypanel para ver si la contraseña o el archivo están mal."
+    });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 API lista en puerto ${PORT}`));
-
+app.listen(PORT, () => console.log(`🚀 Debugger listo en puerto ${PORT}`));
