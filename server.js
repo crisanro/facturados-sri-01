@@ -93,9 +93,21 @@ app.post('/emitir-factura', async (req, res) => {
     const xmlSinFirmar = generateInvoiceXml(invoice);
     console.log("1. XML Generado. Clave:", accessKey);
 
-    // 2. Firmar XML
-    // Convertimos el string Base64 a Buffer para firmar
-    const bufferFirma = Buffer.from(firmaP12, 'base64');
+// 2. Firmar XML
+    // LIMPIEZA AUTOMÁTICA DE BASE64
+    // Si el usuario mandó "data:application/...", lo quitamos para quedarnos solo con el código
+    let firmaLimpia = firmaP12;
+    if (firmaLimpia.includes(",")) {
+        firmaLimpia = firmaLimpia.split(",")[1]; 
+    }
+
+    const bufferFirma = Buffer.from(firmaLimpia, 'base64');
+    
+    // Verificación de seguridad: Si el buffer está vacío o corrupto, avisar antes de crashear
+    if (bufferFirma.length === 0) {
+        throw new Error("La firma electrónica (Base64) parece estar vacía o mal formada.");
+    }
+
     const xmlFirmado = await signXml(bufferFirma, passwordFirma, xmlSinFirmar);
     console.log("2. XML Firmado correctamente.");
 
@@ -134,3 +146,4 @@ app.post('/emitir-factura', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🚀 API lista en puerto ${PORT}`));
+
