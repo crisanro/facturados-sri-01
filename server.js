@@ -25,8 +25,7 @@ const SRI_URLS = {
     }
 };
 
-// --- FUNCIÓN DE REPARACIÓN DE FIRMA (BLINDADA) ---
-// Arregla problemas de contraseñas con caracteres raros y formatos modernos
+// --- FUNCIÓN DE REPARACIÓN (Solo se usa si la original falla) ---
 async function repararFirma(bufferFirma, password) {
     const id = Date.now() + Math.floor(Math.random() * 1000);
     const inputPath = `/tmp/in_${id}.p12`;
@@ -36,7 +35,6 @@ async function repararFirma(bufferFirma, password) {
         fs.writeFileSync(inputPath, bufferFirma);
         
         await new Promise((resolve, reject) => {
-            // Usamos spawn para manejar contraseñas complejas (con @, Ñ, etc)
             const p1 = spawn('openssl', ['pkcs12', '-in', inputPath, '-legacy', '-provider', 'default', '-nodes', '-passin', `pass:${password}`]);
             const p2 = spawn('openssl', ['pkcs12', '-export', '-out', outputPath, '-keypbe', 'PBE-SHA1-3DES', '-certpbe', 'PBE-SHA1-3DES', '-passout', `pass:${password}`]);
             
@@ -53,8 +51,8 @@ async function repararFirma(bufferFirma, password) {
         return fs.readFileSync(outputPath);
 
     } catch (error) {
-        console.error(`⚠️ Error reparando firma (ID ${id}):`, error.message);
-        return bufferFirma; // Si falla, devolvemos la original
+        console.error(`⚠️ Falló reparación (ID ${id}):`, error.message);
+        return null; 
     } finally {
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
         if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
@@ -75,19 +73,19 @@ async function autorizarSRI(claveAcceso, url) {
 }
 
 const app = express();
-// Límite alto para recibir Base64 grandes
 app.use(express.json({ limit: '50mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// RUTA 1: CONSULTAR RUC (TU CÓDIGO)
+// RUTA 1: CONSULTAR RUC (TU CÓDIGO - INTACTO)
 // ==========================================
 app.get('/consultar-ruc/:ruc', async (req, res) => {
     const { ruc } = req.params;
     const urlSRI = `https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumerosRuc?ruc=${ruc}`;
 
     try {
-        console.log(`🔎 Consultando RUC: ${ruc}...`);
+        console.log(`🔎 Consultando datos completos del RUC: ${ruc}...`);
+        
         const response = await fetch(urlSRI, {
             method: 'GET',
             headers: {
@@ -106,6 +104,7 @@ app.get('/consultar-ruc/:ruc', async (req, res) => {
         if (!contribuyente) return res.status(404).json({ error: "RUC no encontrado." });
 
         console.log("✅ Datos encontrados:", contribuyente.razonSocial);
+
         res.json({
             ruc: contribuyente.numeroRuc,
             razonSocial: contribuyente.razonSocial, 
@@ -123,35 +122,55 @@ app.get('/consultar-ruc/:ruc', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 2: EMITIR FACTURA (MODO SAAS)
+// RUTA 2: EMITIR FACTURA (MODO SAAS MEJORADO)
 // ==========================================
 app.post('/emitir-factura', async (req, res) => {
   try {
     const { firmaP12, passwordFirma, ...datosFactura } = req.body;
 
-    // Validación estricta
     if (!firmaP12 || !passwordFirma) {
-        return res.status(400).json({ error: "Faltan credenciales: 'firmaP12' y 'passwordFirma' son obligatorios." });
+        return res.status(400).json({ error: "Faltan credenciales: 'firmaP12' y 'passwordFirma'." });
     }
 
-    // 1. LIMPIEZA Y REPARACIÓN
+    // 1. LIMPIEZA
     let firmaLimpia = firmaP12.includes(",") ? firmaP12.split(",")[1] : firmaP12;
     firmaLimpia = firmaLimpia.replace(/\s/g, ''); 
-    
-    // Reparamos la firma al vuelo
     const bufferOriginal = Buffer.from(firmaLimpia, 'base64');
-    const bufferFirma = await repararFirma(bufferOriginal, passwordFirma);
 
     // 2. GENERAR XML
     const ambiente = datosFactura.infoTributaria.ambiente; 
     const URL_RECEPCION = ambiente === "2" ? SRI_URLS.production.recepcion : SRI_URLS.test.recepcion;
     const URL_AUTORIZACION = ambiente === "2" ? SRI_URLS.production.autorizacion : SRI_URLS.test.autorizacion;
-
     const { invoice, accessKey } = generateInvoice(datosFactura);
     const xmlSinFirmar = generateInvoiceXml(invoice);
 
-    // 3. FIRMAR
-    const xmlFirmado = await signXml(bufferFirma, passwordFirma, xmlSinFirmar);
+    // 3. FIRMADO INTELIGENTE (Try Original -> Catch -> Try Reparado)
+    let xmlFirmado;
+    
+    try {
+        console.log("🔒 Intentando firmar con archivo original...");
+        // Intentamos firmar con el archivo tal cual llegó
+        xmlFirmado = await signXml(bufferOriginal, passwordFirma, xmlSinFirmar);
+    } catch (errorOriginal) {
+        // Si falla, analizamos por qué
+        console.warn("⚠️ Falló firma original:", errorOriginal.message);
+        
+        // Si la contraseña está mal, no sirve de nada reparar. Fallamos directo.
+        if (errorOriginal.message.includes("Invalid password") || errorOriginal.message.includes("MAC")) {
+            throw new Error("Contraseña de firma incorrecta.");
+        }
+
+        // Si es otro error (posiblemente formato moderno), intentamos reparar
+        console.log("🔧 Intentando reparar firma...");
+        const bufferReparado = await repararFirma(bufferOriginal, passwordFirma);
+        
+        if (bufferReparado) {
+            xmlFirmado = await signXml(bufferReparado, passwordFirma, xmlSinFirmar);
+            console.log("✅ Firmado exitoso con archivo reparado.");
+        } else {
+            throw new Error("No se pudo procesar la firma electrónica. Verifica el archivo.");
+        }
+    }
 
     // 4. ENVIAR SRI
     console.log(`Enviando factura de ${datosFactura.infoTributaria.ruc} al SRI...`);
