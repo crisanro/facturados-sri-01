@@ -99,18 +99,17 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-// RUTA 1: CONSULTAR RUC (MEJORADA CON DISFRAZ)
+// RUTA 1: CONSULTAR RUC (CORREGIDA - DATOS REALES)
 // ==========================================
 app.get('/consultar-ruc/:ruc', async (req, res) => {
     const { ruc } = req.params;
     
-    // URL oficial del SRI
-    const urlSRI = `https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc=${ruc}`;
+    // CORRECCIÓN: Usamos 'obtenerPorNumerosRuc' que sí devuelve la info completa
+    const urlSRI = `https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumerosRuc?ruc=${ruc}`;
 
     try {
-        console.log(`🔎 Consultando RUC: ${ruc}...`);
+        console.log(`🔎 Consultando datos completos del RUC: ${ruc}...`);
         
-        // AQUÍ ESTÁ EL TRUCO: Le enviamos cabeceras para parecer un navegador real
         const response = await fetch(urlSRI, {
             method: 'GET',
             headers: {
@@ -122,30 +121,33 @@ app.get('/consultar-ruc/:ruc', async (req, res) => {
         });
         
         if (!response.ok) {
-            console.log("SRI respondió error:", response.status);
-            return res.status(404).json({ error: "RUC no encontrado o SRI bloqueó la petición." });
+            return res.status(response.status).json({ error: "Error consultando al SRI." });
         }
 
         const data = await response.json();
         
-        // Verificamos si trajo datos reales
-        if (!data || !data.numeroRuc) {
-             return res.status(404).json({ error: "El SRI devolvió vacío." });
+        // El SRI devuelve una LISTA, así que tomamos el primero
+        const contribuyente = data[0];
+
+        if (!contribuyente) {
+             return res.status(404).json({ error: "RUC no encontrado." });
         }
 
-        console.log("✅ Datos encontrados:", data.razonSocial);
+        console.log("✅ Datos encontrados:", contribuyente.razonSocial);
 
         res.json({
-            ruc: data.numeroRuc,
-            razonSocial: data.razonSocial,
-            nombreComercial: data.nombreComercial,
-            estado: data.estadoPersona?.descripcion,
-            tipo: data.tipoContribuyente?.descripcion
+            ruc: contribuyente.numeroRuc,
+            razonSocial: contribuyente.razonSocial, 
+            nombreComercial: contribuyente.nombreComercial,
+            estado: contribuyente.estadoPersona?.descripcion,
+            clase: contribuyente.claseContribuyente?.descripcion,
+            tipo: contribuyente.tipoContribuyente?.descripcion,
+            obligadoContabilidad: contribuyente.obligado
         });
 
     } catch (error) {
         console.error("❌ Error consultando RUC:", error.message);
-        res.status(500).json({ error: "Error de conexión con el SRI" });
+        res.status(500).json({ error: "Error interno de conexión con el SRI" });
     }
 });
 
@@ -203,3 +205,4 @@ app.post('/emitir-factura', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🚀 Listo en puerto ${PORT}`));
+
