@@ -8,6 +8,10 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "open-factura": "latest"
+    "open-factura": "latest",
+    "node-fetch": "^2.7.0"
+  },
+  "overrides": {
+    "node-fetch": "^2.7.0"
   }
 }
